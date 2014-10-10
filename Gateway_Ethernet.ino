@@ -20,7 +20,7 @@ Modifications Needed:
 #include <PubSubClient.h>
 
 //I2C receive device address
-const byte MY_ADDRESS = 43;    //I2C comms w/ other Arduino
+const byte MY_ADDRESS = 42;    //I2C comms w/ other Arduino
 
 //Ethernet
 byte mac[]    = {  0x90, 0xA2, 0xDA, 0x0D, 0x11, 0x12 }; // assign mac address to this device. It can be anything, use the one on your ethernet shield if it has one, otherwise make it up. Just make sure it's unique on your network.
