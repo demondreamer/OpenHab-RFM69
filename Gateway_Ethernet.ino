@@ -1,84 +1,142 @@
 /*
-Author:  Eric Tsai
-License:  CC-BY-SA, https://creativecommons.org/licenses/by-sa/2.0/
-Date:  10-10-2014
-File: Ethernet_Gateway.ino
-This sketch takes data struct from I2C and publishes it to
-mosquitto broker. It also subscribes to topics and outputs 
-the topic and message to the serial monitor.
+ Based on work from author:  Eric Tsai
+ Gateway ncorporating both the RFM69 and the ethernet part
+ Revised by Alexandre Bouillot
+ 
+ License:  CC-BY-SA, https://creativecommons.org/licenses/by-sa/2.0/
+ Date:  10-23-2014
+ File: Gateway.ino
+ This sketch receives RFM wireless data and forwards it to Mosquitto relay.
+ 
+ It also subscribes to MQTT topics and sends the payload on to nodes. The payload should be in the format 
+ "node#","device#","value#". For ex. 15,01,01 would send to node 15 only.
+ 
+ Modifications Needed:
+ 1)  Update encryption string "ENCRYPTKEY"
+ 2)  Adjust SS - Chip Select - for RFM69
+ 3)  Adjust MQTT server address
+ */
 
-Modifications Needed:
-1)  Update mac address "mac[]"
-2)  Update MQTT broker IP address "server[]"
-3.  Update the IP address of this device
-4.  Update the 2 subscription areas
-*/
+/*
+RFM69 Pinout:
+ MOSI = 11
+ MISO = 12
+ SCK = 13
+ SS = 8
+ */
 
+/*
+Ethernet Pinout:
+ MOSI = 11
+ MISO = 12
+ SCK = 13
+ SS = 10
+ */
+
+//general --------------------------------
+#define SERIAL_BAUD   115200
+#if 1
+#define DEBUG1(expression)  Serial.print(expression)
+#define DEBUG2(expression, arg)  Serial.print(expression, arg)
+#define DEBUGLN1(expression)  Serial.println(expression)
+#else
+#define DEBUG1(expression)
+#define DEBUG2(expression, arg)
+#define DEBUGLN1(expression)
+#endif
+//RFM69  ----------------------------------
+#include <RFM69.h>
 #include <SPI.h>
-#include <Ethernet.h>
-#include <Wire.h>
-#include <PubSubClient.h>
+#define NODEID        2    //unique for each node on same network
+#define NETWORKID     101  //the same on all nodes that talk to each other
+#define FREQUENCY   RF69_433MHZ
+//#define FREQUENCY   RF69_868MHZ
+//#define FREQUENCY     RF69_915MHZ
+#define ENCRYPTKEY    "1111111111111111" //exactly the same 16 characters/bytes on all nodes!
+#define IS_RFM69HW    //uncomment only for RFM69HW! Leave out if you have RFM69W!
+#define ACK_TIME      30 // max # of ms to wait for an ack
+#define RFM69_SS  8
+RFM69 radio(RFM69_SS);
+bool promiscuousMode = false; //set to 'true' to sniff all packets on the same network
 
-//I2C receive device address
-const byte MY_ADDRESS = 42;    //I2C comms w/ other Arduino
+#include <Ethernet.h>
 
 //Ethernet
-byte mac[]    = {  0x90, 0xA2, 0xDA, 0x0D, 0x11, 0x12 }; // assign mac address to this device. It can be anything, use the one on your ethernet shield if it has one, otherwise make it up. Just make sure it's unique on your network.
-byte server[] = { 192, 168, 1, 143 }; //IP address of the MQTT server. 
-IPAddress ip(192,168,1,107); //IP address of this device
+byte mac[]    = {  
+  0x90, 0xA2, 0xDA, 0x0D, 0x11, 0x12 };
+byte server[] = { 
+  192, 168, 1, 143 };
 
-
-//EthernetClient ethClient;
+IPAddress ip(192,168,1,161);
 EthernetClient ethClient;
+#define DHCP_RETRY 500
+
+// Mosquitto---------------
+#include <PubSubClient.h>
 PubSubClient client(server, 1883, callback, ethClient);
+#define MQTT_CLIENT_ID "arduinoClient"
+#define MQTT_RETRY 500
+int sendMQTT = 0;
 
-// Used to convert millis() to seconds, for debugging MQTT connection status
-unsigned long time=0;
+void MQTTSendInt(PubSubClient* _client, int node, int sensor, int var, int val);
+void MQTTSendLong(PubSubClient* _client, int node, int sensor, int var, long val);
 
-  // MQTT Callback function. This is where the programming goes to respond to payloads on topics you've subscribed to.
-  // currently it just prints the topic and payload out to the serial monitor.
-  // TODO: figure out how to read the payload, parse it out to NodeID, DeviceID, Command, and send it via I2c to the RFM
-  //       gateway to be radio transmitted to the nodes.
-void callback(char* topic, byte* payload, unsigned int length)
+//use LED for indicating MQTT connection status.
+int led = 13;
+
+typedef struct {		
+  int                   nodeID; 
+  int			sensorID;
+  unsigned long         var1_usl; 
+  float                 var2_float; 
+  float			var3_float;	
+} 
+Payload;
+Payload theData;
+
+volatile struct 
 {
-  for (int i=0; i<length; i++) {
-    Serial.print((char)payload[i]);
-  }
-    Serial.println();
-}
-
+  int                   nodeID;
+  int			sensorID;		
+  unsigned long         var1_usl;
+  float                 var2_float;
+  float			var3_float;		//
+  int                   var4_int;
+} 
+SensorNode;
 
 void setup() 
 {
+  Serial.begin(SERIAL_BAUD); 
 
-  Wire.begin (MY_ADDRESS);                        // open communication to the RFM gateway over I2c
-  Serial.begin (9600);                            // open the serial connection to the console for debugging
-  
-        Serial.println("starting... long delay means problem with ethernet");
-  
+  //Ethernet -------------------------
+  //Ethernet.begin(mac, ip);
+
   //wait for IP address
-    while (Ethernet.begin(mac) != 1)              // while there's no ethernet connection, throw an error message and wait 3 seconds
-      {
-        Serial.println("Error getting IP address via DHCP, trying again...");
-        delay(3000);
-      }
-  
-        Serial.println("ethernet OK");
- 
-  Wire.onReceive (receiveEvent);                  // On receiving i2c data, call receiveEvent interrupt function at the end of sketch to process incomming data 
-   
-  while (client.connect("arduinoClient") != 1)    // while there's no MQTT connection, throw an error message and wait 3 seconds
-      {
-        Serial.println("Error connecting to MQTT");
-        delay(3000);
-      }
-        Serial.println("setup complete");
+  while (Ethernet.begin(mac) != 1) {
+    DEBUGLN1("Error getting IP address via DHCP, trying again...");
+    delay(DHCP_RETRY);
+  }
 
+  DEBUGLN1("ethernet OK");
+  // print your local IP address:
+  DEBUGLN1("My IP address: ");
+  for (byte thisByte = 0; thisByte < 4; thisByte++) {
+    // print the value of each byte of the IP address:
+    DEBUG2(Ethernet.localIP()[thisByte], DEC);
+    DEBUG1("."); 
+  }
+  DEBUGLN1();
 
-// ====================================================================================     
-// Enter MQTT subscriptions here and also down in the loop.
-// The ones here will be active as soon as void setup finishes, until the MQTT reconnection happens
-// P.S. use "mosquitto_sub -h 192.168.xxx.xxx -t "#" -v" command line to view all topics in mosquitto
+  // Mosquitto ------------------------------
+  while (client.connect(MQTT_CLIENT_ID) != 1) {
+    DEBUGLN1("Error connecting to MQTT");
+    delay(MQTT_RETRY);
+  }
+  // ====================================================================================     
+  // Enter MQTT subscriptions here and also down in the loop.
+  // The ones here will be active as soon as void setup finishes, until the MQTT reconnection happens
+  // P.S. use "mosquitto_sub -h 192.168.xxx.xxx -t "#" -v" command line to view all topics in mosquitto
 
 
         client.subscribe("1111");
@@ -89,31 +147,39 @@ void setup()
         client.publish("Arduino","Ethernet MQTT Gateway Up");
         
       
-    
-  
+  //RFM69 ---------------------------
+  radio.initialize(FREQUENCY,NODEID,NETWORKID);
+#ifdef IS_RFM69HW
+  radio.setHighPower(); //uncomment only for RFM69HW!
+#endif
+  radio.encrypt(ENCRYPTKEY);
+  radio.promiscuous(promiscuousMode);
+  char buff[50];
+  sprintf(buff, "\nListening at %d Mhz...", FREQUENCY==RF69_433MHZ ? 433 : FREQUENCY==RF69_868MHZ ? 868 : 915);
+  DEBUGLN1(buff);
 
-// ====================================================================================     
-
-
+  DEBUGLN1("setup complete");
 }  // end of setup
 
+byte ackCount=0;
+long watchdogInterval = 2000;
+long watchdog = 0;
+
+void loop() {
+  
+  // calling client.loop too often block the system at some point quite early (~up to 5 loop)
+  // Here is a temporized call to it on a regular interval
+  // This need to be as fast as the fastest sensor received
+  if (millis() > watchdog) {
+//    Serial.print("loop "); 
+//    Serial.println(millis());
+    watchdog += watchdogInterval;
+    //client.loop needs to run every iteration.  Previous version did not.  Big opps.
+   // client.loop();
+// }
 
 
-volatile struct 
-   {
-  int                   nodeID;
-  int			sensorID;		
-  unsigned long         var1_usl;
-  float                 var2_float;
-  float			var3_float;		//
-  int                   var4_int;
-   } SensorNode;
 
-int sendMQTT = 0;
-volatile boolean haveData = false;
-
-void loop() 
-{
    if (!client.loop()) 
      {
  
@@ -145,108 +211,256 @@ void loop()
       else
         {
           Serial.print("failed.");
-            time = millis();
-            Serial.println(time/1000);
         }
     
-  
+     }
      }                                // end if client.loop
-   
-     
-  if (haveData)                      // "recieveEvent" interrupt routine sets this "haveData" variable true when it's complete so the code progresses beyond it
-  {
-
-    Serial.println ();
-    Serial.print ("Received Node ID      = ");
-    Serial.println (SensorNode.nodeID);  
-    Serial.print ("Received Device ID    = ");
-    Serial.println (SensorNode.sensorID);  
-    Serial.print ("1. Time               = ");
-    Serial.print (SensorNode.var1_usl);
-    Serial.print (" millis, ");
-    Serial.print (SensorNode.var1_usl/1000);
-    Serial.print (" seconds, or ");
-    Serial.print ((SensorNode.var1_usl / 1000) /60);
-    Serial.println (" minutes");
-    Serial.print ("2. var2_float         = ");
-    Serial.println (SensorNode.var2_float);
-    Serial.print ("3. var3_float         = ");
-    Serial.println (SensorNode.var3_float);    
-    Serial.print ("4. RSSI               = ");
-    Serial.println (SensorNode.var4_int); 
 
 
-      int varnum;
-      char buff_topic[6];
-      char buff_message[12];      
+  if (radio.receiveDone()) {
+    DEBUG1('[');
+    DEBUG2(radio.SENDERID, DEC);
+    DEBUG1("] ");
+    if (promiscuousMode) {
+      DEBUG1("to [");
+      DEBUG2(radio.TARGETID, DEC);
+      DEBUG1("] ");
+    }
+    DEBUGLN1();
 
-      
-    Serial.println (); 
+    if (radio.DATALEN != sizeof(Payload))
+      Serial.println(F("Invalid payload received, not matching Payload struct!"));
+    else {
+      theData = *(Payload*)radio.DATA; //assume radio.DATA actually contains our struct and not something else
 
+      DEBUG1(theData.sensorID);
+      DEBUG1(", ");
+      DEBUG1(theData.var1_usl);
+      DEBUG1(", ");
+      DEBUG1(theData.var2_float);
+      DEBUG1(", ");
+      DEBUG1(" var2(temperature)=");
+      DEBUG1(", ");
+      DEBUG1(theData.var3_float);
+
+      //printFloat(theData.var2_float, 5); Serial.print(", "); printFloat(theData.var3_float, 5);
+
+      DEBUG1(", RSSI= ");
+      DEBUGLN1(radio.RSSI);
+
+      //save it for i2c:
+      SensorNode.nodeID = theData.nodeID;
+      SensorNode.sensorID = theData.sensorID;
+      SensorNode.var1_usl = theData.var1_usl;
+      SensorNode.var2_float = theData.var2_float;
+      SensorNode.var3_float = theData.var3_float;
+      SensorNode.var4_int = radio.RSSI;
+
+      /*
+      DEBUG1("Received Device ID = ");
+      DEBUGLN1(SensorNode.sensorID);  
+       DEBUG1 ("    Time = ");
+       DEBUGLN1 (SensorNode.var1_usl);
+       DEBUG1 ("    var2_float ");
+       DEBUGLN1 (SensorNode.var2_float);
+       */
+      sendMQTT = 1;
+    }
+
+
+    if (radio.ACK_REQUESTED)
+    {
+      byte theNodeID = radio.SENDERID;
+      radio.sendACK();
+
+      // When a node requests an ACK, respond to the ACK
+      // and also send a packet requesting an ACK (every 3rd one only)
+      // This way both TX/RX NODE functions are tested on 1 end at the GATEWAY
+      if (ackCount++%3==0)
+      {
+        //Serial.print(" Pinging node ");
+        //Serial.print(theNodeID);
+        //Serial.print(" - ACK...");
+        //delay(3); //need this when sending right after reception .. ?
+        //if (radio.sendWithRetry(theNodeID, "ACK TEST", 8, 0))  // 0 = only 1 attempt, no retries
+        //  Serial.print("ok!");
+        //else Serial.print("nothing");
+      }
+    }//end if radio.ACK_REQESTED
+  } //end if radio.receive
+
+  if (sendMQTT == 1) {
+    DEBUGLN1("starting MQTT send");
+
+    if (!client.connected()) {
+      while (client.connect(MQTT_CLIENT_ID) != 1)
+      {
+        digitalWrite(led, LOW);
+        DEBUGLN1("Error connecting to MQTT");
+        delay(500);
+        digitalWrite(led, HIGH);
+      }
+      client.publish("outTopic","hello world");
+    } 
+
+    digitalWrite(led, HIGH);
+    
+    int varnum;
+    char buff_topic[6];
+    char buff_message[12];      
+
+    
       //send var1_usl - This is used to pass millis() value at the time the sensor reading was transmitted
-      varnum = 1;
-      buff_topic[6];
-      buff_message[12];
-      sprintf(buff_topic, "%02d%01d%01d", SensorNode.nodeID, SensorNode.sensorID, varnum);
-      Serial.print("MQTT publish topic: "); 
-      Serial.println(buff_topic);
-      dtostrf (SensorNode.var1_usl, 10, 1, buff_message);
-      client.publish(buff_topic, buff_message);
-      
-      
-      //send var2_float - sensor data
-      varnum = 2;
-      buff_topic[6];
-      buff_message[7];
-      sprintf(buff_topic, "%02d%01d%01d", SensorNode.nodeID, SensorNode.sensorID, varnum);
-      Serial.print("MQTT publish topic: "); 
-      Serial.println(buff_topic);
-      dtostrf (SensorNode.var2_float, 2, 1, buff_message);
-      client.publish(buff_topic, buff_message);
-      
-      delay(200);
-      
-      //send var3_float - sensor data
-      varnum = 3;
-      sprintf(buff_topic, "%02d%01d%01d", SensorNode.nodeID, SensorNode.sensorID, varnum);
-      Serial.print("MQTT publish topic: "); 
-      Serial.println(buff_topic);
-      dtostrf (SensorNode.var3_float, 2, 1, buff_message);
-      client.publish(buff_topic, buff_message);
+     varnum = 1;
+     buff_topic[6];
+     buff_message[12];
+     sprintf(buff_topic, "%02d%01d%01d", SensorNode.nodeID, SensorNode.sensorID, varnum);
+     Serial.println(buff_topic);
+     dtostrf (SensorNode.var1_usl, 10, 1, buff_message);
+     client.publish(buff_topic, buff_message);
+     
 
-      delay(200);
-      
-      //send var4_int, RSSI - This passess on the node's RSSI at the time of sending 
-      varnum = 4;
-      sprintf(buff_topic, "%02d%01d%01d", SensorNode.nodeID, SensorNode.sensorID, varnum);
-      Serial.print("MQTT publish topic: "); 
-      Serial.println(buff_topic);
-      sprintf(buff_message, "%04d%", SensorNode.var4_int);
-      client.publish(buff_topic, buff_message);
+    //send var2_float - sensor data
+    MQTTSendLong(&client, SensorNode.nodeID, SensorNode.sensorID, 2, SensorNode.var2_float);
 
-      Serial.println ();
-      Serial.println("finished MQTT send");
-      Serial.println ();
-          
-  haveData = false;  // set "haveData" false since the data taken from I2C, parsed by the recieveEvent interrupt, has been published to MQTT
-  
-}  // end if haveData
+    //send var3_float - sensor data
+    MQTTSendInt(&client, SensorNode.nodeID, SensorNode.sensorID, 3, SensorNode.var3_float);
 
-}  // end of loop
+    //send var4_int, RSSI
+    MQTTSendInt(&client, SensorNode.nodeID, SensorNode.sensorID, 4, SensorNode.var4_int);
 
+    sendMQTT = 0;
+    DEBUGLN1("finished MQTT send");
+    digitalWrite(led, LOW);
+  }//end if sendMQTT
+}//end loop
 
+void MQTTSendInt(PubSubClient* _client, int node, int sensor, int var, int val) {
+    char buff_topic[6];
+    char buff_message[7];
 
-
-// called by interrupt service routine when incoming data arrives
-void receiveEvent (int howMany)
-{
-  if (howMany < sizeof SensorNode)
-    return;
-    
-  // read into structure
-  byte * p = (byte *) &SensorNode;
-  for (byte i = 0; i < sizeof SensorNode; i++)
-    *p++ = Wire.read ();
-    
-  haveData = true;     // once "haveData" is set true, the sketch will proceed to publish the data to MQTT
+    sprintf(buff_topic, "%02d%01d%01d", node, sensor, var);
+    sprintf(buff_message, "%04d%", val);
+    _client->publish(buff_topic, buff_message);
 }
+
+void MQTTSendLong(PubSubClient* _client, int node, int sensor, int var, long val) {
+    char buff_topic[6];
+    char buff_message[7];
+
+    sprintf(buff_topic, "%02d%01d%01d", node, sensor, var);
+    dtostrf (val, 2, 1, buff_message);
+    _client->publish(buff_topic, buff_message);
+}
+
+// Handing of Mosquitto messages
+void callback(char* topic, byte* payload, unsigned int length) {
+  // handle message arrived
+  DEBUGLN1(F("Mosquitto Callback"));
+
+Serial.println("received MQTT");
+Serial.print(topic);
+
+payload[length] = '\0';
+
+//convert payload to string
+String strPayload = String((char*)payload); //returns number or text string exactly as input
+  
+Serial.print(" = ");
+Serial.println(strPayload); //returns number or text string exactly as input
+
+
+// -------------------------------------------------------------
+//Strings have a method called indexOf() which allows you to search for the index in the String's character array of a particular character. If the character is not found, the method should return -1. A second parameter can be added to the function call to indicate a starting point for the search. In your case, since your delimiters are commas, you would call:
+
+int commaIndex = strPayload.indexOf(',');
+//  Search for the next comma just after the first
+int secondCommaIndex = strPayload.indexOf(',', commaIndex+1);
+//Then you could use that index to create a substring using the String class's substring() method. This returns a new String beginning at a particular starting index, and ending just before a second index (Or the end of a file if none is given). So you would type something akin to:
+int lastCommaIndex = strPayload.lastIndexOf(',');
+
+String firstValue = strPayload.substring(0, commaIndex);
+String secondValue = strPayload.substring(commaIndex+1, secondCommaIndex);
+String thirdValue = strPayload.substring(lastCommaIndex+1); // To the end of the string
+//Finally, the integer values can be retrieved using the String class's undocumented method, toInt():
+
+int node = firstValue.toInt();
+int device = secondValue.toInt();
+int value = thirdValue.toInt();
+//More information on the String object and its various methods can be found int the Arduino documentation.
+
+Serial.print("Sending radio message, node:");
+Serial.print(node);
+Serial.print(", ");
+Serial.print("device: ");
+Serial.print(device);
+Serial.print(", ");
+Serial.print("vaule: ");
+Serial.print(value);
+Serial.print(", ");
+Serial.print("Length = ");
+Serial.println(length);
+
+
+// transmits the MQTT payload to the node# specified in the payload. The payload should match the format
+// node#,device#,value# for ex. 015,12,200
+radio.sendWithRetry(node, payload, length);
+
+Serial.println("send done");
+
+}
+
+//-----------------------------------------NODE CODE-----------------------------------------
+/* Below is code that needs to be put into your -node- to recieve radio communicated payload
+   and parse the data into variables
+
+
+  if (radio.receiveDone())
+  {
+    Serial.print('[');Serial.print(radio.SENDERID, DEC);Serial.print("] ");
+    if (promiscuousMode)
+    {
+      Serial.print("to [");Serial.print(radio.TARGETID, DEC);Serial.print("] ");
+    }
+    for (byte i = 0; i < radio.DATALEN; i++)
+      Serial.print((char)radio.DATA[i]);
+    Serial.print("   [RX_RSSI:");Serial.print(radio.RSSI);Serial.print("]");
+ Serial.println();
+
+
+//convert payload to string
+String strPayload = String((char*)radio.DATA); //returns number or text string exactly as input
+Serial.print(" = ");
+Serial.println(strPayload); //returns number or text string exactly as input
+
+//Strings have a method called indexOf() which allows you to search for the index in the String's character array of a particular character. If the character is not found, the method should return -1. A second parameter can be added to the function call to indicate a starting point for the search. In your case, since your delimiters are commas, you would call:
+
+int commaIndex = strPayload.indexOf(',');
+//  Search for the next comma just after the first
+int secondCommaIndex = strPayload.indexOf(',', commaIndex+1);
+//Then you could use that index to create a substring using the String class's substring() method. This returns a new String beginning at a particular starting index, and ending just before a second index (Or the end of a file if none is given). So you would type something akin to:
+int lastCommaIndex = strPayload.lastIndexOf(',');
+
+String firstValue = strPayload.substring(0, commaIndex);
+String secondValue = strPayload.substring(commaIndex+1, secondCommaIndex);
+String thirdValue = strPayload.substring(lastCommaIndex+1); // To the end of the string
+//Finally, the integer values can be retrieved using the String class's undocumented method, toInt():
+
+int node = firstValue.toInt();
+int device = secondValue.toInt();
+int value = thirdValue.toInt();
+//More information on the String object and its various methods can be found int the Arduino documentation.
+
+Serial.print("Recieve radio message, node:");
+Serial.print(node);
+Serial.print(", ");
+Serial.print("device: ");
+Serial.print(device);
+Serial.print(", ");
+Serial.print("vaule: ");
+Serial.print(value);
+Serial.print(", ");
+Serial.print("Length = ");
+Serial.println(radio.DATALEN);
+
+*/ //end node code
